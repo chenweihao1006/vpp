@@ -1,0 +1,17 @@
+Submodule lib/libbpf contains modified content
+diff --git a/lib/libbpf/src/Makefile b/lib/libbpf/src/Makefile
+index 6be5361..9db2813 100644
+--- a/lib/libbpf/src/Makefile
++++ b/lib/libbpf/src/Makefile
+@@ -30,9 +30,9 @@ $(call allow-override,LD,$(CROSS_COMPILE)ld)
+ TOPDIR = ..
+ 
+ INCLUDES := -I. -I$(TOPDIR)/include -I$(TOPDIR)/include/uapi
+-ALL_CFLAGS := $(INCLUDES)
++ALL_CFLAGS := $(INCLUDES) -fPIC
+ 
+-SHARED_CFLAGS += -fPIC -fvisibility=hidden -DSHARED
++SHARED_CFLAGS += -fvisibility=hidden -DSHARED
+ 
+ CFLAGS ?= -g -O2 -Werror -Wall -std=gnu89
+ ALL_CFLAGS += $(CFLAGS) -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 $(EXTRA_CFLAGS)
