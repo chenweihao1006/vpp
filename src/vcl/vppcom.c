@@ -3618,6 +3618,25 @@ vppcom_session_attr (uint32_t session_handle, uint32_t op,
 	rv = VPPCOM_EINVAL;
       break;
 
+    case VPPCOM_ATTR_GET_LIBC_FD_NUM:
+      rv = session->libc_fd_num;
+      VDBG (2, "VPPCOM_ATTR_GET_LIBC_FD_NUM: libc_fd_num %d", rv);
+      break;
+
+    case VPPCOM_ATTR_SET_LIBC_FD_NUM:
+      if (PREDICT_TRUE (buffer && buflen &&
+			(*buflen == sizeof (session->libc_fd_num))))
+	{
+	  session->libc_fd_num = *(int *) buffer;
+	  *buflen = sizeof (session->libc_fd_num);
+
+	  VDBG (2, "VPPCOM_ATTR_SET_LIBC_FD_NUM: libc_fd_num %d, buflen %d",
+		session->libc_fd_num, *buflen);
+	}
+      else
+	rv = VPPCOM_EINVAL;
+      break;
+
     case VPPCOM_ATTR_GET_PROTOCOL:
       if (buffer && buflen && (*buflen >= sizeof (int)))
 	{

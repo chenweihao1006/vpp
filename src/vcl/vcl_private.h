@@ -166,6 +166,7 @@ typedef struct vcl_session_
   vppcom_epoll_t vep;
   u32 attributes;		/**< see @ref vppcom_session_attr_t */
   int libc_epfd;
+  int libc_fd_num;
   u32 vrf;
   u16 gso_size;
 

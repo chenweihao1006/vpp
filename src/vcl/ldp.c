@@ -67,6 +67,16 @@
 #define UDP_SEGMENT 103
 #endif
 
+#ifndef EPOLL_CTL_ADD
+#define EPOLL_CTL_ADD 1
+#endif
+#ifndef EPOLL_CTL_DEL
+#define EPOLL_CTL_DEL 2
+#endif
+#ifndef EPOLL_CTL_MOD
+#define EPOLL_CTL_MOD 3
+#endif
+
 typedef struct ldp_worker_ctx_
 {
   u8 *io_buffer;
@@ -2443,7 +2453,7 @@ epoll_ctl (int epfd, int op, int fd, struct epoll_event *event)
     }
   else
     {
-      int libc_epfd;
+      int libc_epfd, libc_fd_num = 0;
       u32 size = sizeof (epfd);
 
       libc_epfd = vls_attr (vep_vlsh, VPPCOM_ATTR_GET_LIBC_EPFD, 0, 0);
@@ -2467,6 +2477,15 @@ epoll_ctl (int epfd, int op, int fd, struct epoll_event *event)
 	      rv = -1;
 	      goto done;
 	    }
+
+    rv = vls_attr (vep_vlsh, VPPCOM_ATTR_SET_LIBC_FD_NUM, &libc_fd_num,
+       &size);
+    if (rv < 0)
+	    {
+	      errno = -rv;
+	      rv = -1;
+	      goto done;
+	    }
 	}
       else if (PREDICT_FALSE (libc_epfd < 0))
 	{
@@ -2479,6 +2498,37 @@ epoll_ctl (int epfd, int op, int fd, struct epoll_event *event)
 	    " event %p", epfd, libc_epfd, op, fd, event);
 
       rv = libc_epoll_ctl (libc_epfd, op, fd, event);
+      if (rv < 0)
+	    {
+	      errno = -rv;
+	      rv = -1;
+	      goto done;
+	    }
+
+      if (PREDICT_TRUE (op == EPOLL_CTL_ADD || op == EPOLL_CTL_DEL)) {
+        libc_fd_num = vls_attr (vep_vlsh, VPPCOM_ATTR_GET_LIBC_FD_NUM, 0, 0);
+        if (libc_fd_num < 0)
+        {
+          rv = libc_fd_num;
+          goto done;
+        }
+
+        if (op == EPOLL_CTL_ADD)
+          ++libc_fd_num;
+        else if(op == EPOLL_CTL_DEL) {
+          ASSERT (libc_fd_num > 0);
+          --libc_fd_num;
+        }
+
+        rv = vls_attr (vep_vlsh, VPPCOM_ATTR_SET_LIBC_FD_NUM, &libc_fd_num,
+        &size);
+        if (rv < 0)
+        {
+          errno = -rv;
+          rv = -1;
+          goto done;
+        }
+      }
     }
 
 done:
@@ -2491,7 +2541,7 @@ ldp_epoll_pwait (int epfd, struct epoll_event *events, int maxevents,
 {
   ldp_worker_ctx_t *ldpw;
   double time_to_wait = (double) 0, max_time;
-  int libc_epfd, rv = 0;
+  int libc_epfd, libc_fd_num, rv = 0;
   vls_handle_t ep_vlsh;
 
   ldp_init_check ();
@@ -2516,6 +2566,29 @@ ldp_epoll_pwait (int epfd, struct epoll_event *events, int maxevents,
       errno = EBADFD;
       return -1;
     }
+
+  libc_fd_num = vls_attr (ep_vlsh, VPPCOM_ATTR_GET_LIBC_FD_NUM, 0, 0);
+  if (PREDICT_FALSE (libc_fd_num < 0))
+    {
+      errno = -libc_fd_num;
+      rv = -1;
+      goto done;
+    }
+
+  if (PREDICT_TRUE(libc_fd_num < 1)) {
+    rv = vls_epoll_wait (ep_vlsh, events, maxevents, timeout);
+    if (rv >= 0)
+	    {
+	      ldpw->epoll_wait_vcl = 1;
+	      goto done;
+	    }
+	  else
+	    {
+	      errno = -rv;
+	      rv = -1;
+	      goto done;
+	    }
+  }
 
   if (PREDICT_FALSE (ldpw->clib_time.init_cpu_time == 0))
     clib_time_init (&ldpw->clib_time);
@@ -2570,7 +2643,7 @@ static inline int
 ldp_epoll_pwait_eventfd (int epfd, struct epoll_event *events,
 			 int maxevents, int timeout, const sigset_t * sigmask)
 {
-  int libc_epfd, rv = 0, num_ev, libc_num_ev, vcl_wups = 0;
+  int libc_epfd, libc_fd_num, rv = 0, num_ev, libc_num_ev, vcl_wups = 0;
   struct epoll_event *libc_evts;
   ldp_worker_ctx_t *ldpw;
   vls_handle_t ep_vlsh;
@@ -2599,6 +2672,29 @@ ldp_epoll_pwait_eventfd (int epfd, struct epoll_event *events,
       errno = EBADFD;
       return -1;
     }
+
+  libc_fd_num = vls_attr (ep_vlsh, VPPCOM_ATTR_GET_LIBC_FD_NUM, 0, 0);
+  if (PREDICT_FALSE (libc_fd_num < 0))
+    {
+      errno = -libc_fd_num;
+      rv = -1;
+      goto done;
+    }
+
+  if (PREDICT_TRUE(libc_fd_num < 1)) {
+    rv = vls_epoll_wait (ep_vlsh, events, maxevents, timeout);
+    if (rv >= 0)
+	    {
+	      ldpw->epoll_wait_vcl = 1;
+	      goto done;
+	    }
+	  else
+	    {
+	      errno = -rv;
+	      rv = -1;
+	      goto done;
+	    }
+  }
 
   libc_epfd = vls_attr (ep_vlsh, VPPCOM_ATTR_GET_LIBC_EPFD, 0, 0);
   if (PREDICT_FALSE (!libc_epfd))
