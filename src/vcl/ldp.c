@@ -2575,7 +2575,7 @@ ldp_epoll_pwait (int epfd, struct epoll_event *events, int maxevents,
       goto done;
     }
 
-  if (PREDICT_TRUE(libc_fd_num < 1)) {
+  if (libc_fd_num < 1) {
     rv = vls_epoll_wait (ep_vlsh, events, maxevents, timeout);
     if (rv >= 0)
 	    {
@@ -2681,7 +2681,7 @@ ldp_epoll_pwait_eventfd (int epfd, struct epoll_event *events,
       goto done;
     }
 
-  if (PREDICT_TRUE(libc_fd_num < 1)) {
+  if (libc_fd_num < 1) {
     rv = vls_epoll_wait (ep_vlsh, events, maxevents, timeout);
     if (rv >= 0)
 	    {
