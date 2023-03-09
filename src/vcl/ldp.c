@@ -732,9 +732,9 @@ ldp_pselect (int nfds, fd_set * __restrict readfds,
   u32 minbits = clib_max (nfds, BITS (uword)), n_bytes;
   ldp_worker_ctx_t *ldpw = ldp_worker_get_current ();
   struct timespec libc_tspec = { 0 };
-  f64 time_out, vcl_timeout = 0;
+  f64 time_out, time_to_wait = 0, vcl_timeout = 0;
   uword si_bits, libc_bits;
-  int rv, bits_set = 0;
+  int rv, bits_set = 0, libc_block = 0;
 
   if (nfds < 0)
     {
@@ -750,6 +750,7 @@ ldp_pselect (int nfds, fd_set * __restrict readfds,
       time_out = (timeout->tv_sec == 0 && timeout->tv_nsec == 0) ?
 	(f64) 0 : (f64) timeout->tv_sec + (f64) timeout->tv_nsec / (f64) 1e9;
 
+      time_to_wait = time_out;
       time_out += clib_time_now (&ldpw->clib_time);
 
       /* select as fine grained sleep */
@@ -765,8 +766,10 @@ ldp_pselect (int nfds, fd_set * __restrict readfds,
       errno = EINVAL;
       return -1;
     }
-  else
+  else {
     time_out = -1;
+    time_to_wait = -1;
+  }
 
   if (nfds <= ldp->vlsh_bit_val)
     {
@@ -798,8 +801,14 @@ ldp_pselect (int nfds, fd_set * __restrict readfds,
       goto done;
     }
 
-  if (!si_bits)
+  if (!si_bits) {
     libc_tspec = timeout ? *timeout : libc_tspec;
+    if (!timeout)
+      	libc_block = 1;
+  }
+
+  if (!libc_bits)
+    vcl_timeout = time_to_wait;
 
   do
     {
@@ -868,7 +877,7 @@ ldp_pselect (int nfds, fd_set * __restrict readfds,
 			     readfds ? (fd_set *) ldpw->rd_bitmap : NULL,
 			     writefds ? (fd_set *) ldpw->wr_bitmap : NULL,
 			     exceptfds ? (fd_set *) ldpw->ex_bitmap : NULL,
-			     &libc_tspec, sigmask);
+			     libc_block ? NULL : &libc_tspec, sigmask);
 	  if (rv > 0)
 	    {
 	      ldp_select_libc_map_merge (ldpw->rd_bitmap, readfds);
@@ -884,7 +893,7 @@ ldp_pselect (int nfds, fd_set * __restrict readfds,
 	  goto done;
 	}
     }
-  while ((time_out == -1) || (clib_time_now (&ldpw->clib_time) < time_out));
+  while ((time_out == -1 && si_bits && libc_bits) || (clib_time_now (&ldpw->clib_time) < time_out));
   rv = 0;
 
 done:
@@ -2859,6 +2868,30 @@ poll (struct pollfd *fds, nfds_t nfds, int timeout)
 	  vec_add1 (ldpw->libc_poll_idxs, i);
 	}
     }
+
+  if (PREDICT_FALSE (!vec_len (ldpw->vcl_poll) && !vec_len (ldpw->libc_poll)))
+    {
+      errno = EINVAL;
+      rv = -1;
+      goto done;
+    }
+
+  if (!vec_len (ldpw->vcl_poll)) {
+    rv = libc_poll (ldpw->libc_poll, vec_len (ldpw->libc_poll), timeout);
+	  goto done;
+  }
+
+  if (!vec_len (ldpw->libc_poll)) {
+    rv = vppcom_poll (ldpw->vcl_poll, vec_len (ldpw->vcl_poll), (f64)timeout);
+    if (rv < 0)
+	    {
+	      errno = -rv;
+	      rv = -1;
+	      goto done;
+	    }
+	  else
+	    goto done;
+  }
 
   do
     {
