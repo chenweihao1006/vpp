@@ -69,6 +69,35 @@ format_transport_proto_short (u8 * s, va_list * args)
   return s;
 }
 
+const char *transport_flags_str[] = {
+#define _(sym, str) str,
+  foreach_transport_connection_flag
+#undef _
+};
+
+u8 *
+format_transport_flags (u8 *s, va_list *args)
+{
+  transport_connection_flags_t flags;
+  int i, last = -1;
+
+  flags = va_arg (*args, transport_connection_flags_t);
+
+  for (i = 0; i < TRANSPORT_CONNECTION_N_FLAGS; i++)
+    if (flags & (1 << i))
+      last = i;
+
+  for (i = 0; i < last; i++)
+    {
+      if (flags & (1 << i))
+	s = format (s, "%s, ", transport_flags_str[i]);
+    }
+  if (last >= 0)
+    s = format (s, "%s", transport_flags_str[last]);
+
+  return s;
+}
+
 u8 *
 format_transport_connection (u8 * s, va_list * args)
 {
@@ -93,8 +122,8 @@ format_transport_connection (u8 * s, va_list * args)
       if (transport_connection_is_tx_paced (tc))
 	s = format (s, "%Upacer: %U\n", format_white_space, indent,
 		    format_transport_pacer, &tc->pacer, tc->thread_index);
-      s = format (s, "%Utransport: flags 0x%x\n", format_white_space, indent,
-		  tc->flags);
+      s = format (s, "%Utransport: flags: %U\n", format_white_space, indent,
+		  format_transport_flags, tc->flags);
     }
   return s;
 }
@@ -578,10 +607,6 @@ transport_alloc_local_port (u8 proto, ip46_address_t *lcl_addr,
   /* Only support active opens from one of ctrl threads */
   ASSERT (vlib_get_thread_index () <= transport_cl_thread ());
 
-  /* Cleanup freelist if need be */
-  if (vec_len (tm->lcl_endpts_freelist))
-    transport_cleanup_freelist ();
-
   /* Search for first free slot */
   for (tries = 0; tries < limit; tries++)
     {
@@ -669,6 +694,7 @@ transport_alloc_local_endpoint (u8 proto, transport_endpoint_cfg_t * rmt_cfg,
 				ip46_address_t * lcl_addr, u16 * lcl_port)
 {
   transport_endpoint_t *rmt = (transport_endpoint_t *) rmt_cfg;
+  transport_main_t *tm = &tp_main;
   session_error_t error;
   int port;
 
@@ -689,6 +715,10 @@ transport_alloc_local_endpoint (u8 proto, transport_endpoint_cfg_t * rmt_cfg,
 			sizeof (rmt_cfg->peer.ip));
     }
 
+  /* Cleanup freelist if need be */
+  if (vec_len (tm->lcl_endpts_freelist))
+    transport_cleanup_freelist ();
+
   /*
    * Allocate source port
    */
@@ -704,7 +734,18 @@ transport_alloc_local_endpoint (u8 proto, transport_endpoint_cfg_t * rmt_cfg,
       port = clib_net_to_host_u16 (rmt_cfg->peer.port);
       *lcl_port = port;
 
-      return transport_endpoint_mark_used (proto, lcl_addr, port);
+      if (!transport_endpoint_mark_used (proto, lcl_addr, port))
+	return 0;
+
+      /* IP:port pair already in use, check if 6-tuple available */
+      if (session_lookup_connection (rmt->fib_index, lcl_addr, &rmt->ip, port,
+				     rmt->port, proto, rmt->is_ip4))
+	return SESSION_E_PORTINUSE;
+
+      /* 6-tuple is available so increment lcl endpoint refcount */
+      transport_share_local_endpoint (proto, lcl_addr, port);
+
+      return 0;
     }
 
   return 0;

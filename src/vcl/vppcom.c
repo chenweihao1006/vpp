@@ -2281,12 +2281,17 @@ vppcom_session_write_inline (vcl_worker_t *wrk, vcl_session_t *s, void *buf,
     et = SESSION_IO_EVT_TX_FLUSH;
 
   if (is_dgram)
-    n_write =
-      app_send_dgram_raw_gso (tx_fifo, &s->transport, s->vpp_evt_q, buf, n,
-			      s->gso_size, et, 0 /* do_evt */, SVM_Q_WAIT);
+    {
+      et = vcl_session_dgram_tx_evt (s, et);
+      n_write =
+	app_send_dgram_raw_gso (tx_fifo, &s->transport, s->vpp_evt_q, buf, n,
+				s->gso_size, et, 0 /* do_evt */, SVM_Q_WAIT);
+    }
   else
-    n_write = app_send_stream_raw (tx_fifo, s->vpp_evt_q, buf, n, et,
-				   0 /* do_evt */ , SVM_Q_WAIT);
+    {
+      n_write = app_send_stream_raw (tx_fifo, s->vpp_evt_q, buf, n, et,
+				     0 /* do_evt */, SVM_Q_WAIT);
+    }
 
   if (svm_fifo_set_event (s->tx_fifo))
     app_send_io_evt_to_vpp (
@@ -2409,11 +2414,17 @@ vcl_select_handle_mq_event (vcl_worker_t * wrk, session_event_t * e,
 	sid = e->session_index;
       if (sid == VCL_INVALID_SESSION_INDEX)
 	break;
-      if (sid < n_bits && write_map)
-	{
-	  clib_bitmap_set_no_check ((uword *) write_map, sid, 1);
-	  *bits_set += 1;
-	}
+      if (!(sid < n_bits && write_map))
+	break;
+      clib_bitmap_set_no_check ((uword *) write_map, sid, 1);
+      *bits_set += 1;
+      s = vcl_session_get (wrk, sid);
+      if (!s->tx_fifo)
+	break;
+      /* We didn't have a fifo when the event was added */
+      svm_fifo_add_want_deq_ntf (
+	(vcl_session_is_ct (s) ? s->ct_tx_fifo : s->tx_fifo),
+	SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
       break;
     case SESSION_CTRL_EVT_DISCONNECTED:
       disconnected_msg = (session_disconnected_msg_t *) e->data;
@@ -2623,7 +2634,7 @@ vppcom_select (int n_bits, vcl_si_set * read_map, vcl_si_set * write_map,
 	  clib_bitmap_set_no_check ((uword *) write_map, sid, 1);
 	  bits_set++;
 	}
-      else
+      else if (s->tx_fifo)
 	{
 	  svm_fifo_t *txf = vcl_session_is_ct (s) ? s->ct_tx_fifo : s->tx_fifo;
 	  svm_fifo_add_want_deq_ntf (txf, SVM_FIFO_WANT_DEQ_NOTIF);
@@ -2676,7 +2687,7 @@ vep_verify_epoll_chain (vcl_worker_t * wrk, u32 vep_handle)
   u32 sh = vep_handle;
   vcl_session_t *s;
 
-  if (VPPCOM_DEBUG <= 2)
+  if (VPPCOM_DEBUG <= 3)
     return;
 
   s = vcl_session_get_w_handle (wrk, vep_handle);
@@ -3093,7 +3104,7 @@ vcl_epoll_wait_handle_mq_event (vcl_worker_t * wrk, session_event_t * e,
 	break;
       session_events = s->vep.ev.events;
       /* Generate EPOLLOUT because there's no connected event */
-      if (!(EPOLLOUT & session_events))
+      if (!(EPOLLOUT & session_events) || !s->tx_fifo)
 	break;
       /* We didn't have a fifo when the event was added */
       svm_fifo_add_want_deq_ntf (
