@@ -13,12 +13,14 @@
  * limitations under the License.
  */
 
+#include <sys/random.h>
 #include <vnet/ipsec/ipsec.h>
 #include <vnet/ipsec/esp.h>
 #include <vnet/udp/udp_local.h>
 #include <vnet/fib/fib_table.h>
 #include <vnet/fib/fib_entry_track.h>
 #include <vnet/ipsec/ipsec_tun.h>
+#include <vnet/ipsec/ipsec.api_enum.h>
 
 /**
  * @brief
@@ -28,10 +30,8 @@ vlib_combined_counter_main_t ipsec_sa_counters = {
   .name = "SA",
   .stat_segment_name = "/net/ipsec/sa",
 };
-vlib_simple_counter_main_t ipsec_sa_lost_counters = {
-  .name = "SA-lost",
-  .stat_segment_name = "/net/ipsec/sa/lost",
-};
+/* Per-SA error counters */
+vlib_simple_counter_main_t ipsec_sa_err_counters[IPSEC_SA_N_ERRORS];
 
 ipsec_sa_t *ipsec_sa_pool;
 
@@ -93,14 +93,35 @@ ipsec_sa_stack (ipsec_sa_t * sa)
 }
 
 void
+ipsec_sa_set_async_mode (ipsec_sa_t *sa, int is_enabled)
+{
+  if (is_enabled)
+    {
+      sa->crypto_key_index = sa->crypto_async_key_index;
+      sa->crypto_enc_op_id = sa->crypto_async_enc_op_id;
+      sa->crypto_dec_op_id = sa->crypto_async_dec_op_id;
+      sa->integ_key_index = ~0;
+      sa->integ_op_id = ~0;
+    }
+  else
+    {
+      sa->crypto_key_index = sa->crypto_sync_key_index;
+      sa->crypto_enc_op_id = sa->crypto_sync_enc_op_id;
+      sa->crypto_dec_op_id = sa->crypto_sync_dec_op_id;
+      sa->integ_key_index = sa->integ_sync_key_index;
+      sa->integ_op_id = sa->integ_sync_op_id;
+    }
+}
+
+void
 ipsec_sa_set_crypto_alg (ipsec_sa_t * sa, ipsec_crypto_alg_t crypto_alg)
 {
   ipsec_main_t *im = &ipsec_main;
   sa->crypto_alg = crypto_alg;
   sa->crypto_iv_size = im->crypto_algs[crypto_alg].iv_size;
   sa->esp_block_align = clib_max (4, im->crypto_algs[crypto_alg].block_align);
-  sa->sync_op_data.crypto_enc_op_id = im->crypto_algs[crypto_alg].enc_op_id;
-  sa->sync_op_data.crypto_dec_op_id = im->crypto_algs[crypto_alg].dec_op_id;
+  sa->crypto_sync_enc_op_id = im->crypto_algs[crypto_alg].enc_op_id;
+  sa->crypto_sync_dec_op_id = im->crypto_algs[crypto_alg].dec_op_id;
   sa->crypto_calg = im->crypto_algs[crypto_alg].alg;
   ASSERT (sa->crypto_iv_size <= ESP_MAX_IV_SIZE);
   ASSERT (sa->esp_block_align <= ESP_MAX_BLOCK_SIZE);
@@ -123,7 +144,7 @@ ipsec_sa_set_integ_alg (ipsec_sa_t * sa, ipsec_integ_alg_t integ_alg)
   ipsec_main_t *im = &ipsec_main;
   sa->integ_alg = integ_alg;
   sa->integ_icv_size = im->integ_algs[integ_alg].icv_size;
-  sa->sync_op_data.integ_op_id = im->integ_algs[integ_alg].op_id;
+  sa->integ_sync_op_id = im->integ_algs[integ_alg].op_id;
   sa->integ_calg = im->integ_algs[integ_alg].alg;
   ASSERT (sa->integ_icv_size <= ESP_MAX_ICV_SIZE);
 }
@@ -134,38 +155,32 @@ ipsec_sa_set_async_op_ids (ipsec_sa_t * sa)
   /* *INDENT-OFF* */
   if (ipsec_sa_is_set_USE_ESN (sa))
     {
-#define _(n, s, k) \
-  if( sa->sync_op_data.crypto_enc_op_id == VNET_CRYPTO_OP_##n##_ENC ) \
-    sa->async_op_data.crypto_async_enc_op_id = \
-      VNET_CRYPTO_OP_##n##_TAG16_AAD12_ENC; \
-  if( sa->sync_op_data.crypto_dec_op_id == VNET_CRYPTO_OP_##n##_DEC ) \
-    sa->async_op_data.crypto_async_dec_op_id = \
-      VNET_CRYPTO_OP_##n##_TAG16_AAD12_DEC;
-    foreach_crypto_aead_alg
+#define _(n, s, k)                                                            \
+  if (sa->crypto_sync_enc_op_id == VNET_CRYPTO_OP_##n##_ENC)                  \
+    sa->crypto_async_enc_op_id = VNET_CRYPTO_OP_##n##_TAG16_AAD12_ENC;        \
+  if (sa->crypto_sync_dec_op_id == VNET_CRYPTO_OP_##n##_DEC)                  \
+    sa->crypto_async_dec_op_id = VNET_CRYPTO_OP_##n##_TAG16_AAD12_DEC;
+      foreach_crypto_aead_alg
 #undef _
     }
   else
     {
-#define _(n, s, k) \
-  if( sa->sync_op_data.crypto_enc_op_id == VNET_CRYPTO_OP_##n##_ENC ) \
-    sa->async_op_data.crypto_async_enc_op_id = \
-      VNET_CRYPTO_OP_##n##_TAG16_AAD8_ENC; \
-  if( sa->sync_op_data.crypto_dec_op_id == VNET_CRYPTO_OP_##n##_DEC ) \
-    sa->async_op_data.crypto_async_dec_op_id = \
-      VNET_CRYPTO_OP_##n##_TAG16_AAD8_DEC;
-    foreach_crypto_aead_alg
+#define _(n, s, k)                                                            \
+  if (sa->crypto_sync_enc_op_id == VNET_CRYPTO_OP_##n##_ENC)                  \
+    sa->crypto_async_enc_op_id = VNET_CRYPTO_OP_##n##_TAG16_AAD8_ENC;         \
+  if (sa->crypto_sync_dec_op_id == VNET_CRYPTO_OP_##n##_DEC)                  \
+    sa->crypto_async_dec_op_id = VNET_CRYPTO_OP_##n##_TAG16_AAD8_DEC;
+      foreach_crypto_aead_alg
 #undef _
     }
 
-#define _(c, h, s, k ,d) \
-  if( sa->sync_op_data.crypto_enc_op_id == VNET_CRYPTO_OP_##c##_ENC && \
-      sa->sync_op_data.integ_op_id == VNET_CRYPTO_OP_##h##_HMAC) \
-    sa->async_op_data.crypto_async_enc_op_id = \
-      VNET_CRYPTO_OP_##c##_##h##_TAG##d##_ENC; \
-  if( sa->sync_op_data.crypto_dec_op_id == VNET_CRYPTO_OP_##c##_DEC && \
-      sa->sync_op_data.integ_op_id == VNET_CRYPTO_OP_##h##_HMAC) \
-    sa->async_op_data.crypto_async_dec_op_id = \
-      VNET_CRYPTO_OP_##c##_##h##_TAG##d##_DEC;
+#define _(c, h, s, k, d)                                                      \
+  if (sa->crypto_sync_enc_op_id == VNET_CRYPTO_OP_##c##_ENC &&                \
+      sa->integ_sync_op_id == VNET_CRYPTO_OP_##h##_HMAC)                      \
+    sa->crypto_async_enc_op_id = VNET_CRYPTO_OP_##c##_##h##_TAG##d##_ENC;     \
+  if (sa->crypto_sync_dec_op_id == VNET_CRYPTO_OP_##c##_DEC &&                \
+      sa->integ_sync_op_id == VNET_CRYPTO_OP_##h##_HMAC)                      \
+    sa->crypto_async_dec_op_id = VNET_CRYPTO_OP_##c##_##h##_TAG##d##_DEC;
   foreach_crypto_link_async_alg
 #undef _
   /* *INDENT-ON* */
@@ -314,6 +329,7 @@ ipsec_sa_add_and_lock (u32 id, u32 spi, ipsec_protocol_t proto,
   clib_error_t *err;
   ipsec_sa_t *sa;
   u32 sa_index;
+  u64 rand[2];
   uword *p;
   int rv;
 
@@ -321,7 +337,12 @@ ipsec_sa_add_and_lock (u32 id, u32 spi, ipsec_protocol_t proto,
   if (p)
     return VNET_API_ERROR_ENTRY_ALREADY_EXISTS;
 
+  if (getrandom (rand, sizeof (rand), 0) != sizeof (rand))
+    return VNET_API_ERROR_INIT_FAILED;
+
   pool_get_aligned_zero (ipsec_sa_pool, sa, CLIB_CACHE_LINE_BYTES);
+
+  clib_pcg64i_srandom_r (&sa->iv_prng, rand[0], rand[1]);
 
   fib_node_init (&sa->node, FIB_NODE_TYPE_IPSEC_SA);
   fib_node_lock (&sa->node);
@@ -329,8 +350,11 @@ ipsec_sa_add_and_lock (u32 id, u32 spi, ipsec_protocol_t proto,
 
   vlib_validate_combined_counter (&ipsec_sa_counters, sa_index);
   vlib_zero_combined_counter (&ipsec_sa_counters, sa_index);
-  vlib_validate_simple_counter (&ipsec_sa_lost_counters, sa_index);
-  vlib_zero_simple_counter (&ipsec_sa_lost_counters, sa_index);
+  for (int i = 0; i < IPSEC_SA_N_ERRORS; i++)
+    {
+      vlib_validate_simple_counter (&ipsec_sa_err_counters[i], sa_index);
+      vlib_zero_simple_counter (&ipsec_sa_err_counters[i], sa_index);
+    }
 
   tunnel_copy (tun, &sa->tunnel);
   sa->id = id;
@@ -350,10 +374,9 @@ ipsec_sa_add_and_lock (u32 id, u32 spi, ipsec_protocol_t proto,
 
   clib_memcpy (&sa->crypto_key, ck, sizeof (sa->crypto_key));
 
-  sa->crypto_key_index = vnet_crypto_key_add (vm,
-					      im->crypto_algs[crypto_alg].alg,
-					      (u8 *) ck->data, ck->len);
-  if (~0 == sa->crypto_key_index)
+  sa->crypto_sync_key_index = vnet_crypto_key_add (
+    vm, im->crypto_algs[crypto_alg].alg, (u8 *) ck->data, ck->len);
+  if (~0 == sa->crypto_sync_key_index)
     {
       pool_put (ipsec_sa_pool, sa);
       return VNET_API_ERROR_KEY_LENGTH;
@@ -361,36 +384,34 @@ ipsec_sa_add_and_lock (u32 id, u32 spi, ipsec_protocol_t proto,
 
   if (integ_alg != IPSEC_INTEG_ALG_NONE)
     {
-      sa->integ_key_index = vnet_crypto_key_add (vm,
-						 im->
-						 integ_algs[integ_alg].alg,
-						 (u8 *) ik->data, ik->len);
-      if (~0 == sa->integ_key_index)
+      sa->integ_sync_key_index = vnet_crypto_key_add (
+	vm, im->integ_algs[integ_alg].alg, (u8 *) ik->data, ik->len);
+      if (~0 == sa->integ_sync_key_index)
 	{
 	  pool_put (ipsec_sa_pool, sa);
 	  return VNET_API_ERROR_KEY_LENGTH;
 	}
     }
 
-  if (sa->async_op_data.crypto_async_enc_op_id &&
-      !ipsec_sa_is_set_IS_AEAD (sa))
-    {				//AES-CBC & HMAC
-      sa->async_op_data.linked_key_index =
-	vnet_crypto_key_add_linked (vm, sa->crypto_key_index,
-				    sa->integ_key_index);
-    }
+  if (sa->crypto_async_enc_op_id && !ipsec_sa_is_set_IS_AEAD (sa))
+    sa->crypto_async_key_index =
+      vnet_crypto_key_add_linked (vm, sa->crypto_sync_key_index,
+				  sa->integ_sync_key_index); // AES-CBC & HMAC
+  else
+    sa->crypto_async_key_index = sa->crypto_sync_key_index;
 
   if (im->async_mode)
-    sa->crypto_op_data = sa->async_op_data.data;
+    {
+      ipsec_sa_set_async_mode (sa, 1);
+    }
+  else if (ipsec_sa_is_set_IS_ASYNC (sa))
+    {
+      vnet_crypto_request_async_mode (1);
+      ipsec_sa_set_async_mode (sa, 1 /* is_enabled */);
+    }
   else
     {
-      if (ipsec_sa_is_set_IS_ASYNC (sa))
-	{
-	  vnet_crypto_request_async_mode (1);
-	  sa->crypto_op_data = sa->async_op_data.data;
-	}
-      else
-	sa->crypto_op_data = sa->sync_op_data.data;
+      ipsec_sa_set_async_mode (sa, 0 /* is_enabled */);
     }
 
   err = ipsec_check_support_cb (im, sa);
@@ -487,7 +508,7 @@ ipsec_sa_del (ipsec_sa_t * sa)
     {
       vnet_crypto_request_async_mode (0);
       if (!ipsec_sa_is_set_IS_AEAD (sa))
-	vnet_crypto_key_del (vm, sa->async_op_data.linked_key_index);
+	vnet_crypto_key_del (vm, sa->crypto_async_key_index);
     }
 
   if (ipsec_sa_is_set_UDP_ENCAP (sa) && ipsec_sa_is_set_IS_INBOUND (sa))
@@ -496,9 +517,9 @@ ipsec_sa_del (ipsec_sa_t * sa)
 
   if (ipsec_sa_is_set_IS_TUNNEL (sa) && !ipsec_sa_is_set_IS_INBOUND (sa))
     dpo_reset (&sa->dpo);
-  vnet_crypto_key_del (vm, sa->crypto_key_index);
+  vnet_crypto_key_del (vm, sa->crypto_sync_key_index);
   if (sa->integ_alg != IPSEC_INTEG_ALG_NONE)
-    vnet_crypto_key_del (vm, sa->integ_key_index);
+    vnet_crypto_key_del (vm, sa->integ_sync_key_index);
   pool_put (ipsec_sa_pool, sa);
 }
 
@@ -567,7 +588,8 @@ void
 ipsec_sa_clear (index_t sai)
 {
   vlib_zero_combined_counter (&ipsec_sa_counters, sai);
-  vlib_zero_simple_counter (&ipsec_sa_lost_counters, sai);
+  for (int i = 0; i < IPSEC_SA_N_ERRORS; i++)
+    vlib_zero_simple_counter (&ipsec_sa_err_counters[i], sai);
 }
 
 void
@@ -640,16 +662,24 @@ const static fib_node_vft_t ipsec_sa_vft = {
   .fnv_back_walk = ipsec_sa_back_walk,
 };
 
-/* force inclusion from application's main.c */
+/* Init per-SA error counters and node type */
 clib_error_t *
-ipsec_sa_interface_init (vlib_main_t * vm)
+ipsec_sa_init (vlib_main_t *vm)
 {
   fib_node_register_type (FIB_NODE_TYPE_IPSEC_SA, &ipsec_sa_vft);
 
-  return 0;
+#define _(index, val, err, desc)                                              \
+  ipsec_sa_err_counters[index].name =                                         \
+    (char *) format (0, "SA-" #err "%c", 0);                                  \
+  ipsec_sa_err_counters[index].stat_segment_name =                            \
+    (char *) format (0, "/net/ipsec/sa/err/" #err "%c", 0);                   \
+  ipsec_sa_err_counters[index].counters = 0;
+  foreach_ipsec_sa_err
+#undef _
+    return 0;
 }
 
-VLIB_INIT_FUNCTION (ipsec_sa_interface_init);
+VLIB_INIT_FUNCTION (ipsec_sa_init);
 
 /*
  * fd.io coding-style-patch-verification: ON

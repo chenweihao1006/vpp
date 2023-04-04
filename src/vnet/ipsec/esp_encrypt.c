@@ -219,17 +219,18 @@ esp_get_ip6_hdr_len (ip6_header_t * ip6, ip6_ext_header_t ** ext_hdr)
  * encryption mode: IVs must be unpredictable for AES-CBC whereas it can
  * be predictable but should never be reused with the same key material
  * for CTR and GCM.
- * We use a packet counter as the IV for CTR and GCM, and to ensure the
- * IV is unpredictable for CBC, it is then encrypted using the same key
- * as the message. You can refer to NIST SP800-38a and NIST SP800-38d
- * for more details. */
+ * To avoid reusing the same IVs between multiple VPP instances and between
+ * restarts, we use a properly chosen PRNG to generate IVs. To ensure the IV is
+ * unpredictable for CBC, it is then encrypted using the same key as the
+ * message. You can refer to NIST SP800-38a and NIST SP800-38d for more
+ * details. */
 static_always_inline void *
 esp_generate_iv (ipsec_sa_t *sa, void *payload, int iv_sz)
 {
   ASSERT (iv_sz >= sizeof (u64));
   u64 *iv = (u64 *) (payload - iv_sz);
   clib_memset_u8 (iv, 0, iv_sz);
-  *iv = sa->iv_counter++;
+  *iv = clib_pcg64i_random_r (&sa->iv_prng);
   return iv;
 }
 
@@ -254,8 +255,10 @@ esp_process_chained_ops (vlib_main_t * vm, vlib_node_runtime_t * node,
       if (op->status != VNET_CRYPTO_OP_STATUS_COMPLETED)
 	{
 	  u32 bi = op->user_data;
-	  b[bi]->error = node->errors[ESP_ENCRYPT_ERROR_CRYPTO_ENGINE_ERROR];
-	  nexts[bi] = drop_next;
+	  esp_encrypt_set_next_index (b[bi], node, vm->thread_index,
+				      ESP_ENCRYPT_ERROR_CRYPTO_ENGINE_ERROR,
+				      bi, nexts, drop_next,
+				      vnet_buffer (b[bi])->ipsec.sad_index);
 	  n_fail--;
 	}
       op++;
@@ -282,8 +285,10 @@ esp_process_ops (vlib_main_t * vm, vlib_node_runtime_t * node,
       if (op->status != VNET_CRYPTO_OP_STATUS_COMPLETED)
 	{
 	  u32 bi = op->user_data;
-	  b[bi]->error = node->errors[ESP_ENCRYPT_ERROR_CRYPTO_ENGINE_ERROR];
-	  nexts[bi] = drop_next;
+	  esp_encrypt_set_next_index (b[bi], node, vm->thread_index,
+				      ESP_ENCRYPT_ERROR_CRYPTO_ENGINE_ERROR,
+				      bi, nexts, drop_next,
+				      vnet_buffer (b[bi])->ipsec.sad_index);
 	  n_fail--;
 	}
       op++;
@@ -430,7 +435,7 @@ esp_prepare_sync_op (vlib_main_t *vm, ipsec_per_thread_data_t *ptd,
 	  crypto_len += iv_sz;
 	}
 
-      if (lb != b[0])
+      if (PREDICT_FALSE (lb != b[0]))
 	{
 	  /* is chained */
 	  op->flags |= VNET_CRYPTO_OP_FLAG_CHAINED_BUFFERS;
@@ -493,7 +498,7 @@ esp_prepare_async_frame (vlib_main_t *vm, ipsec_per_thread_data_t *ptd,
   esp_post_data_t *post = esp_post_data (b);
   u8 *tag, *iv, *aad = 0;
   u8 flag = 0;
-  u32 key_index;
+  const u32 key_index = sa->crypto_key_index;
   i16 crypto_start_offset, integ_start_offset;
   u16 crypto_total_len, integ_total_len;
 
@@ -503,8 +508,6 @@ esp_prepare_async_frame (vlib_main_t *vm, ipsec_per_thread_data_t *ptd,
   crypto_start_offset = integ_start_offset = payload - b->data;
   crypto_total_len = integ_total_len = payload_len - icv_sz;
   tag = payload + crypto_total_len;
-
-  key_index = sa->linked_key_index;
 
   /* generate the IV in front of the payload */
   void *pkt_iv = esp_generate_iv (sa, payload, iv_sz);
@@ -519,7 +522,6 @@ esp_prepare_async_frame (vlib_main_t *vm, ipsec_per_thread_data_t *ptd,
 	  /* constuct aad in a scratch space in front of the nonce */
 	  aad = (u8 *) nonce - sizeof (esp_aead_t);
 	  esp_aad_fill (aad, esp, sa, sa->seq_hi);
-	  key_index = sa->crypto_key_index;
 	}
       else
 	{
@@ -659,8 +661,8 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  if (PREDICT_FALSE (INDEX_INVALID == sa_index0))
 	    {
 	      err = ESP_ENCRYPT_ERROR_NO_PROTECTION;
-	      esp_set_next_index (b[0], node, err, n_noop, noop_nexts,
-				  drop_next);
+	      noop_nexts[n_noop] = drop_next;
+	      b[0]->error = node->errors[err];
 	      goto trace;
 	    }
 	}
@@ -670,10 +672,9 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       if (sa_index0 != current_sa_index)
 	{
 	  if (current_sa_packets)
-	    vlib_increment_combined_counter (&ipsec_sa_counters, thread_index,
-					     current_sa_index,
-					     current_sa_packets,
-					     current_sa_bytes);
+	    vlib_increment_combined_counter (
+	      &ipsec_sa_counters, thread_index, current_sa_index,
+	      current_sa_packets, current_sa_bytes);
 	  current_sa_packets = current_sa_bytes = 0;
 
 	  sa0 = ipsec_sa_get (sa_index0);
@@ -683,14 +684,18 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 			     !ipsec_sa_is_set_NO_ALGO_NO_DROP (sa0)))
 	    {
 	      err = ESP_ENCRYPT_ERROR_NO_ENCRYPTION;
-	      esp_set_next_index (b[0], node, err, n_noop, noop_nexts,
-				  drop_next);
+	      esp_encrypt_set_next_index (b[0], node, thread_index, err,
+					  n_noop, noop_nexts, drop_next,
+					  sa_index0);
 	      goto trace;
 	    }
+	  current_sa_index = sa_index0;
+	  vlib_prefetch_combined_counter (&ipsec_sa_counters, thread_index,
+					  current_sa_index);
+
 	  /* fetch the second cacheline ASAP */
 	  clib_prefetch_load (sa0->cacheline1);
 
-	  current_sa_index = sa_index0;
 	  spi = clib_net_to_host_u32 (sa0->spi);
 	  esp_align = sa0->esp_block_align;
 	  icv_sz = sa0->integ_icv_size;
@@ -698,7 +703,7 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  is_async = im->async_mode | ipsec_sa_is_set_IS_ASYNC (sa0);
 	}
 
-      if (PREDICT_FALSE (~0 == sa0->thread_index))
+      if (PREDICT_FALSE ((u16) ~0 == sa0->thread_index))
 	{
 	  /* this is the first packet to use this SA, claim the SA
 	   * for this thread. this could happen simultaneously on
@@ -711,8 +716,9 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	{
 	  vnet_buffer (b[0])->ipsec.thread_index = sa0->thread_index;
 	  err = ESP_ENCRYPT_ERROR_HANDOFF;
-	  esp_set_next_index (b[0], node, err, n_noop, noop_nexts,
-			      handoff_next);
+	  esp_encrypt_set_next_index (b[0], node, thread_index, err, n_noop,
+				      noop_nexts, handoff_next,
+				      current_sa_index);
 	  goto trace;
 	}
 
@@ -721,7 +727,8 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       if (n_bufs == 0)
 	{
 	  err = ESP_ENCRYPT_ERROR_NO_BUFFERS;
-	  esp_set_next_index (b[0], node, err, n_noop, noop_nexts, drop_next);
+	  esp_encrypt_set_next_index (b[0], node, thread_index, err, n_noop,
+				      noop_nexts, drop_next, current_sa_index);
 	  goto trace;
 	}
 
@@ -735,7 +742,8 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
       if (PREDICT_FALSE (esp_seq_advance (sa0)))
 	{
 	  err = ESP_ENCRYPT_ERROR_SEQ_CYCLED;
-	  esp_set_next_index (b[0], node, err, n_noop, noop_nexts, drop_next);
+	  esp_encrypt_set_next_index (b[0], node, thread_index, err, n_noop,
+				      noop_nexts, drop_next, current_sa_index);
 	  goto trace;
 	}
 
@@ -751,8 +759,9 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  if (!next_hdr_ptr)
 	    {
 	      err = ESP_ENCRYPT_ERROR_NO_BUFFERS;
-	      esp_set_next_index (b[0], node, err, n_noop, noop_nexts,
-				  drop_next);
+	      esp_encrypt_set_next_index (b[0], node, thread_index, err,
+					  n_noop, noop_nexts, drop_next,
+					  current_sa_index);
 	      goto trace;
 	    }
 	  b[0]->flags &= ~VLIB_BUFFER_TOTAL_LENGTH_VALID;
@@ -873,8 +882,9 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  if ((old_ip_hdr - ip_len) < &b[0]->pre_data[0])
 	    {
 	      err = ESP_ENCRYPT_ERROR_NO_BUFFERS;
-	      esp_set_next_index (b[0], node, err, n_noop, noop_nexts,
-				  drop_next);
+	      esp_encrypt_set_next_index (b[0], node, thread_index, err,
+					  n_noop, noop_nexts, drop_next,
+					  current_sa_index);
 	      goto trace;
 	    }
 
@@ -886,8 +896,9 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	  if (!next_hdr_ptr)
 	    {
 	      err = ESP_ENCRYPT_ERROR_NO_BUFFERS;
-	      esp_set_next_index (b[0], node, err, n_noop, noop_nexts,
-				  drop_next);
+	      esp_encrypt_set_next_index (b[0], node, thread_index, err,
+					  n_noop, noop_nexts, drop_next,
+					  current_sa_index);
 	      goto trace;
 	    }
 
@@ -1076,7 +1087,8 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    {
 	      n_noop += esp_async_recycle_failed_submit (
 		vm, *async_frame, node, ESP_ENCRYPT_ERROR_CRYPTO_ENGINE_ERROR,
-		n_noop, noop_bi, noop_nexts, drop_next);
+		IPSEC_SA_ERROR_CRYPTO_ENGINE_ERROR, n_noop, noop_bi,
+		noop_nexts, drop_next);
 	      vnet_crypto_async_reset_frame (*async_frame);
 	      vnet_crypto_async_free_frame (vm, *async_frame);
 	    }

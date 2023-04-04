@@ -16,10 +16,15 @@
 #define __IPSEC_SPD_SA_H__
 
 #include <vlib/vlib.h>
+#include <vppinfra/pcg.h>
 #include <vnet/crypto/crypto.h>
 #include <vnet/ip/ip.h>
 #include <vnet/fib/fib_node.h>
 #include <vnet/tunnel/tunnel.h>
+
+#define ESP_MAX_ICV_SIZE   (32)
+#define ESP_MAX_IV_SIZE	   (16)
+#define ESP_MAX_BLOCK_SIZE (16)
 
 #define foreach_ipsec_crypto_alg                                              \
   _ (0, NONE, "none")                                                         \
@@ -118,51 +123,60 @@ typedef enum ipsec_sad_flags_t_
 
 STATIC_ASSERT (sizeof (ipsec_sa_flags_t) == 2, "IPSEC SA flags != 2 byte");
 
+#define foreach_ipsec_sa_err                                                  \
+  _ (0, LOST, lost, "packets lost")                                           \
+  _ (1, HANDOFF, handoff, "hand-off")                                         \
+  _ (2, INTEG_ERROR, integ_error, "Integrity check failed")                   \
+  _ (3, DECRYPTION_FAILED, decryption_failed, "Decryption failed")            \
+  _ (4, CRYPTO_ENGINE_ERROR, crypto_engine_error,                             \
+     "crypto engine error (dropped)")                                         \
+  _ (5, REPLAY, replay, "SA replayed packet")                                 \
+  _ (6, RUNT, runt, "undersized packet")                                      \
+  _ (7, NO_BUFFERS, no_buffers, "no buffers (dropped)")                       \
+  _ (8, OVERSIZED_HEADER, oversized_header,                                   \
+     "buffer with oversized header (dropped)")                                \
+  _ (9, NO_TAIL_SPACE, no_tail_space,                                         \
+     "no enough buffer tail space (dropped)")                                 \
+  _ (10, TUN_NO_PROTO, tun_no_proto, "no tunnel protocol")                    \
+  _ (11, UNSUP_PAYLOAD, unsup_payload, "unsupported payload")                 \
+  _ (12, SEQ_CYCLED, seq_cycled, "sequence number cycled (dropped)")          \
+  _ (13, CRYPTO_QUEUE_FULL, crypto_queue_full, "crypto queue full (dropped)") \
+  _ (14, NO_ENCRYPTION, no_encryption, "no Encrypting SA (dropped)")          \
+  _ (15, DROP_FRAGMENTS, drop_fragments, "IP fragments drop")
+
+typedef enum
+{
+#define _(v, f, s, d) IPSEC_SA_ERROR_##f = v,
+  foreach_ipsec_sa_err
+#undef _
+    IPSEC_SA_N_ERRORS,
+} __clib_packed ipsec_sa_err_t;
+
 typedef struct
 {
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline0);
 
-  /* flags */
-  ipsec_sa_flags_t flags;
+  clib_pcg64i_random_t iv_prng;
 
-  u8 crypto_iv_size;
-  u8 esp_block_align;
-  u8 integ_icv_size;
-
-  u8 __pad1[3];
-
-  u32 thread_index;
-
-  u32 spi;
-  u32 seq;
-  u32 seq_hi;
   u64 replay_window;
-  u64 iv_counter;
   dpo_id_t dpo;
 
   vnet_crypto_key_index_t crypto_key_index;
   vnet_crypto_key_index_t integ_key_index;
 
-  /* Union data shared by sync and async ops, updated when mode is
-   * changed. */
-  union
-  {
-    struct
-    {
-      vnet_crypto_op_id_t crypto_enc_op_id:16;
-      vnet_crypto_op_id_t crypto_dec_op_id:16;
-      vnet_crypto_op_id_t integ_op_id:16;
-    };
+  u32 spi;
+  u32 seq;
+  u32 seq_hi;
 
-    struct
-    {
-      vnet_crypto_async_op_id_t crypto_async_enc_op_id:16;
-      vnet_crypto_async_op_id_t crypto_async_dec_op_id:16;
-      vnet_crypto_key_index_t linked_key_index;
-    };
+  u16 crypto_enc_op_id;
+  u16 crypto_dec_op_id;
+  u16 integ_op_id;
+  ipsec_sa_flags_t flags;
+  u16 thread_index;
 
-    u64 crypto_op_data;
-  };
+  u16 integ_icv_size : 6;
+  u16 crypto_iv_size : 5;
+  u16 esp_block_align : 5;
 
   CLIB_CACHE_LINE_ALIGN_MARK (cacheline1);
 
@@ -184,30 +198,7 @@ typedef struct
     CLIB_CACHE_LINE_ALIGN_MARK (cacheline2);
 
   /* Elements with u64 size multiples */
-  union
-  {
-    struct
-    {
-      vnet_crypto_op_id_t crypto_enc_op_id:16;
-      vnet_crypto_op_id_t crypto_dec_op_id:16;
-      vnet_crypto_op_id_t integ_op_id:16;
-    };
-    u64 data;
-  } sync_op_data;
-
-  union
-  {
-    struct
-    {
-      vnet_crypto_async_op_id_t crypto_async_enc_op_id:16;
-      vnet_crypto_async_op_id_t crypto_async_dec_op_id:16;
-      vnet_crypto_key_index_t linked_key_index;
-    };
-    u64 data;
-  } async_op_data;
-
   tunnel_t tunnel;
-
   fib_node_t node;
 
   /* elements with u32 size */
@@ -215,6 +206,16 @@ typedef struct
   u32 stat_index;
   vnet_crypto_alg_t integ_calg;
   vnet_crypto_alg_t crypto_calg;
+  u32 crypto_sync_key_index;
+  u32 integ_sync_key_index;
+  u32 crypto_async_key_index;
+
+  /* elements with u16 size */
+  u16 crypto_sync_enc_op_id;
+  u16 crypto_sync_dec_op_id;
+  u16 integ_sync_op_id;
+  u16 crypto_async_enc_op_id;
+  u16 crypto_async_dec_op_id;
 
   /* else u8 packed */
   ipsec_crypto_alg_t crypto_alg;
@@ -224,6 +225,10 @@ typedef struct
   ipsec_key_t crypto_key;
 } ipsec_sa_t;
 
+STATIC_ASSERT (VNET_CRYPTO_N_OP_IDS < (1 << 16), "crypto ops overflow");
+STATIC_ASSERT (ESP_MAX_ICV_SIZE < (1 << 6), "integer icv overflow");
+STATIC_ASSERT (ESP_MAX_IV_SIZE < (1 << 5), "esp iv overflow");
+STATIC_ASSERT (ESP_MAX_BLOCK_SIZE < (1 << 5), "esp alignment overflow");
 STATIC_ASSERT_OFFSET_OF (ipsec_sa_t, cacheline1, CLIB_CACHE_LINE_BYTES);
 STATIC_ASSERT_OFFSET_OF (ipsec_sa_t, cacheline2, 2 * CLIB_CACHE_LINE_BYTES);
 
@@ -266,7 +271,7 @@ foreach_ipsec_sa_flags
  * SA packet & bytes counters
  */
 extern vlib_combined_counter_main_t ipsec_sa_counters;
-extern vlib_simple_counter_main_t ipsec_sa_lost_counters;
+extern vlib_simple_counter_main_t ipsec_sa_err_counters[IPSEC_SA_N_ERRORS];
 
 extern void ipsec_mk_key (ipsec_key_t * key, const u8 * data, u8 len);
 
@@ -287,6 +292,7 @@ extern void ipsec_sa_set_crypto_alg (ipsec_sa_t * sa,
 				     ipsec_crypto_alg_t crypto_alg);
 extern void ipsec_sa_set_integ_alg (ipsec_sa_t * sa,
 				    ipsec_integ_alg_t integ_alg);
+extern void ipsec_sa_set_async_mode (ipsec_sa_t *sa, int is_enabled);
 
 typedef walk_rc_t (*ipsec_sa_walk_cb_t) (ipsec_sa_t * sa, void *ctx);
 extern void ipsec_sa_walk (ipsec_sa_walk_cb_t cd, void *ctx);
@@ -639,8 +645,8 @@ ipsec_sa_anti_replay_advance (ipsec_sa_t *sa, u32 thread_index, u32 seq,
  * Makes choice for thread_id should be assigned.
  *  if input ~0, gets random worker_id based on unix_time_now_nsec
 */
-always_inline u32
-ipsec_sa_assign_thread (u32 thread_id)
+always_inline u16
+ipsec_sa_assign_thread (u16 thread_id)
 {
   return ((thread_id) ? thread_id
 	  : (unix_time_now_nsec () % vlib_num_workers ()) + 1);
