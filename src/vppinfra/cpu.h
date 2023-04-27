@@ -21,12 +21,15 @@
 
 #if defined(__x86_64__)
 #define foreach_march_variant                                                 \
+  _ (scalar, "Generic (SIMD disabled)")                                       \
   _ (hsw, "Intel Haswell")                                                    \
   _ (trm, "Intel Tremont")                                                    \
   _ (skx, "Intel Skylake (server) / Cascade Lake")                            \
   _ (icl, "Intel Ice Lake")                                                   \
   _ (adl, "Intel Alder Lake")                                                 \
-  _ (spr, "Intel Sapphire Rapids")
+  _ (spr, "Intel Sapphire Rapids")                                            \
+  _ (znver3, "AMD Milan")                                                     \
+  _ (znver4, "AMD Genoa")
 #elif defined(__aarch64__)
 #define foreach_march_variant                                                 \
   _ (octeontx2, "Marvell Octeon TX2")                                         \
@@ -38,6 +41,10 @@
 #define foreach_march_variant
 #endif
 
+#define amd_vendor(t1, t2, t3)                                                \
+  ((t1 == 0x68747541) && /* htuA */                                           \
+   (t2 == 0x444d4163) && /* DMAc */                                           \
+   (t3 == 0x69746e65))	 /* itne */
 typedef enum
 {
   CLIB_MARCH_VARIANT_TYPE = 0,
@@ -142,7 +149,8 @@ _CLIB_MARCH_FN_REGISTRATION(fn)
   _ (movdir64b, 7, ecx, 28)                                                   \
   _ (enqcmd, 7, ecx, 29)                                                      \
   _ (avx512_fp16, 7, edx, 23)                                                 \
-  _ (invariant_tsc, 0x80000007, edx, 8)
+  _ (invariant_tsc, 0x80000007, edx, 8)                                       \
+  _ (monitorx, 0x80000001, ecx, 29)
 
 #define foreach_aarch64_flags \
 _ (fp,          0) \
@@ -242,6 +250,12 @@ clib_cpu_supports_aes ()
 }
 
 static inline int
+clib_cpu_march_priority_scalar ()
+{
+  return 1;
+}
+
+static inline int
 clib_cpu_march_priority_spr ()
 {
   if (clib_cpu_supports_enqcmd ())
@@ -286,6 +300,22 @@ clib_cpu_march_priority_hsw ()
 {
   if (clib_cpu_supports_avx2 ())
     return 50;
+  return -1;
+}
+
+static inline int
+clib_cpu_march_priority_znver4 ()
+{
+  if (clib_cpu_supports_avx512_bitalg () && clib_cpu_supports_monitorx ())
+    return 250;
+  return -1;
+}
+
+static inline int
+clib_cpu_march_priority_znver3 ()
+{
+  if (clib_cpu_supports_avx2 () && clib_cpu_supports_monitorx ())
+    return 70;
   return -1;
 }
 
