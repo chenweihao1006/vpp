@@ -418,7 +418,6 @@ F:	src/plugins/dpdk/
 
 Plugin - DPDK Crypto
 I:	dpdk-cryptodev
-M:	Sergio Gonzalez Monroy <sergio.gonzalez.monroy@outlook.com>
 M:	Radu Nicolau <radu.nicolau@intel.com>
 M:	Fan Zhang <roy.fan.zhang@intel.com>
 F:	src/plugins/dpdk/cryptodev/
@@ -770,6 +769,11 @@ Plugin - geneve
 I:	geneve
 M:	community vpp-dev@lists.fd.io
 F:	src/plugins/geneve/
+
+Plugin - IP session redirect
+I:	ip_session_redirect
+M:	Benoît Ganne <bganne@cisco.com>
+F:	src/plugins/ip_session_redirect/
 
 Plugin - linux-cp
 I:	linux-cp

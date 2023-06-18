@@ -52,6 +52,7 @@ from scapy.layers.inet import IPerror, TCPerror, UDPerror, ICMPerror
 from scapy.layers.inet6 import ICMPv6DestUnreach, ICMPv6EchoRequest
 from scapy.layers.inet6 import ICMPv6EchoReply
 from vpp_running import use_running
+from test_result_code import TestResultCode
 
 
 logger = logging.getLogger(__name__)
@@ -59,13 +60,6 @@ logger = logging.getLogger(__name__)
 # Set up an empty logger for the testcase that can be overridden as necessary
 null_logger = logging.getLogger("VppTestCase")
 null_logger.addHandler(logging.NullHandler())
-
-PASS = 0
-FAIL = 1
-ERROR = 2
-SKIP = 3
-TEST_RUN = 4
-SKIP_CPU_SHORTAGE = 5
 
 
 if config.debug_framework:
@@ -329,7 +323,7 @@ class VppTestCase(CPUInterface, unittest.TestCase):
     """
 
     extra_vpp_statseg_config = ""
-    extra_vpp_punt_config = []
+    extra_vpp_config = []
     extra_vpp_plugin_config = []
     logger = null_logger
     vapi_response_timeout = 5
@@ -538,8 +532,8 @@ class VppTestCase(CPUInterface, unittest.TestCase):
             ]
         )
 
-        if cls.extra_vpp_punt_config is not None:
-            cls.vpp_cmdline.extend(cls.extra_vpp_punt_config)
+        if cls.extra_vpp_config is not None:
+            cls.vpp_cmdline.extend(cls.extra_vpp_config)
 
         if not cls.debug_attach:
             cls.logger.info("vpp_cmdline args: %s" % cls.vpp_cmdline)
@@ -1511,13 +1505,15 @@ class VppTestCase(CPUInterface, unittest.TestCase):
                             f"{stats_snapshot[cntr][:, sw_if_index].sum()}, "
                             f"expected diff: {diff})",
                         )
-                    except IndexError:
+                    except IndexError as e:
                         # if diff is 0, then this most probably a case where
                         # test declares multiple interfaces but traffic hasn't
                         # passed through this one yet - which means the counter
                         # value is 0 and can be ignored
                         if 0 != diff:
-                            raise
+                            raise Exception(
+                                f"Couldn't sum counter: {cntr} on sw_if_index: {sw_if_index}"
+                            ) from e
 
     def send_and_assert_no_replies(
         self, intf, pkts, remark="", timeout=None, stats_diff=None, trace=True, msg=None
@@ -1664,6 +1660,7 @@ class VppTestResult(unittest.TestResult):
         self.stream = stream
         self.descriptions = descriptions
         self.verbosity = verbosity
+        self.result_code = TestResultCode.TEST_RUN
         self.result_string = None
         self.runner = runner
         self.printed = []
@@ -1675,15 +1672,25 @@ class VppTestResult(unittest.TestResult):
         :param test:
 
         """
-        if self.current_test_case_info:
-            self.current_test_case_info.logger.debug(
-                "--- addSuccess() %s.%s(%s) called"
-                % (test.__class__.__name__, test._testMethodName, test._testMethodDoc)
-            )
+        self.log_result("addSuccess", test)
         unittest.TestResult.addSuccess(self, test)
         self.result_string = colorize("OK", GREEN)
+        self.result_code = TestResultCode.PASS
+        self.send_result_through_pipe(test, self.result_code)
 
-        self.send_result_through_pipe(test, PASS)
+    def addExpectedFailure(self, test, err):
+        self.log_result("addExpectedFailure", test, err)
+        super().addExpectedFailure(test, err)
+        self.result_string = colorize("FAIL", GREEN)
+        self.result_code = TestResultCode.EXPECTED_FAIL
+        self.send_result_through_pipe(test, self.result_code)
+
+    def addUnexpectedSuccess(self, test):
+        self.log_result("addUnexpectedSuccess", test)
+        super().addUnexpectedSuccess(test)
+        self.result_string = colorize("OK", RED)
+        self.result_code = TestResultCode.UNEXPECTED_PASS
+        self.send_result_through_pipe(test, self.result_code)
 
     def addSkip(self, test, reason):
         """
@@ -1693,23 +1700,15 @@ class VppTestResult(unittest.TestResult):
         :param reason:
 
         """
-        if self.current_test_case_info:
-            self.current_test_case_info.logger.debug(
-                "--- addSkip() %s.%s(%s) called, reason is %s"
-                % (
-                    test.__class__.__name__,
-                    test._testMethodName,
-                    test._testMethodDoc,
-                    reason,
-                )
-            )
+        self.log_result("addSkip", test, reason=reason)
         unittest.TestResult.addSkip(self, test, reason)
         self.result_string = colorize("SKIP", YELLOW)
 
         if reason == "not enough cpus":
-            self.send_result_through_pipe(test, SKIP_CPU_SHORTAGE)
+            self.result_code = TestResultCode.SKIP_CPU_SHORTAGE
         else:
-            self.send_result_through_pipe(test, SKIP)
+            self.result_code = TestResultCode.SKIP
+        self.send_result_through_pipe(test, self.result_code)
 
     def symlink_failed(self):
         if self.current_test_case_info:
@@ -1741,7 +1740,7 @@ class VppTestResult(unittest.TestResult):
             if pipe:
                 pipe.send((test.id(), result))
 
-    def log_error(self, test, err, fn_name):
+    def log_result(self, fn, test, err=None, reason=None):
         if self.current_test_case_info:
             if isinstance(test, unittest.suite._ErrorHolder):
                 test_name = test.description
@@ -1751,25 +1750,29 @@ class VppTestResult(unittest.TestResult):
                     test._testMethodName,
                     test._testMethodDoc,
                 )
+            extra_msg = ""
+            if err:
+                extra_msg += f", error is {err}"
+            if reason:
+                extra_msg += f", reason is {reason}"
             self.current_test_case_info.logger.debug(
-                "--- %s() %s called, err is %s" % (fn_name, test_name, err)
+                f"--- {fn}() {test_name} called{extra_msg}"
             )
-            self.current_test_case_info.logger.debug(
-                "formatted exception is:\n%s" % "".join(format_exception(*err))
-            )
+            if err:
+                self.current_test_case_info.logger.debug(
+                    "formatted exception is:\n%s" % "".join(format_exception(*err))
+                )
 
-    def add_error(self, test, err, unittest_fn, error_type):
-        if error_type == FAIL:
-            self.log_error(test, err, "addFailure")
+    def add_error(self, test, err, unittest_fn, result_code):
+        self.result_code = result_code
+        if result_code == TestResultCode.FAIL:
+            self.log_result("addFailure", test, err=err)
             error_type_str = colorize("FAIL", RED)
-        elif error_type == ERROR:
-            self.log_error(test, err, "addError")
+        elif result_code == TestResultCode.ERROR:
+            self.log_result("addError", test, err=err)
             error_type_str = colorize("ERROR", RED)
         else:
-            raise Exception(
-                "Error type %s cannot be used to record an "
-                "error or a failure" % error_type
-            )
+            raise Exception(f"Unexpected result code {result_code}")
 
         unittest_fn(self, test, err)
         if self.current_test_case_info:
@@ -1792,7 +1795,7 @@ class VppTestResult(unittest.TestResult):
         else:
             self.result_string = "%s [no temp dir]" % error_type_str
 
-        self.send_result_through_pipe(test, error_type)
+        self.send_result_through_pipe(test, result_code)
 
     def addFailure(self, test, err):
         """
@@ -1802,7 +1805,7 @@ class VppTestResult(unittest.TestResult):
         :param err: error message
 
         """
-        self.add_error(test, err, unittest.TestResult.addFailure, FAIL)
+        self.add_error(test, err, unittest.TestResult.addFailure, TestResultCode.FAIL)
 
     def addError(self, test, err):
         """
@@ -1812,7 +1815,7 @@ class VppTestResult(unittest.TestResult):
         :param err: error message
 
         """
-        self.add_error(test, err, unittest.TestResult.addError, ERROR)
+        self.add_error(test, err, unittest.TestResult.addError, TestResultCode.ERROR)
 
     def getDescription(self, test):
         """
@@ -1905,23 +1908,40 @@ class VppTestResult(unittest.TestResult):
         """
         unittest.TestResult.stopTest(self, test)
 
+        result_code_to_suffix = {
+            TestResultCode.PASS: "",
+            TestResultCode.FAIL: "",
+            TestResultCode.ERROR: "",
+            TestResultCode.SKIP: "",
+            TestResultCode.TEST_RUN: "",
+            TestResultCode.SKIP_CPU_SHORTAGE: "",
+            TestResultCode.EXPECTED_FAIL: " [EXPECTED FAIL]",
+            TestResultCode.UNEXPECTED_PASS: " [UNEXPECTED PASS]",
+        }
+
         if self.verbosity > 0:
             self.stream.writeln(single_line_delim)
             self.stream.writeln(
-                "%-73s%s" % (self.getDescription(test), self.result_string)
+                "%-72s%s%s"
+                % (
+                    self.getDescription(test),
+                    self.result_string,
+                    result_code_to_suffix[self.result_code],
+                )
             )
             self.stream.writeln(single_line_delim)
         else:
             self.stream.writeln(
-                "%-68s %4.2f %s"
+                "%-67s %4.2f %s%s"
                 % (
                     self.getDescription(test),
                     time.time() - self.start_test,
                     self.result_string,
+                    result_code_to_suffix[self.result_code],
                 )
             )
 
-        self.send_result_through_pipe(test, TEST_RUN)
+        self.send_result_through_pipe(test, TestResultCode.TEST_RUN)
 
     def printErrors(self):
         """

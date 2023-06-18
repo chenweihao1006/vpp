@@ -999,6 +999,16 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	    {
 	      async_frames[async_op] =
 		vnet_crypto_async_get_frame (vm, async_op);
+
+	      if (PREDICT_FALSE (!async_frames[async_op]))
+		{
+		  err = ESP_ENCRYPT_ERROR_NO_AVAIL_FRAME;
+		  esp_encrypt_set_next_index (b[0], node, thread_index, err,
+					      n_noop, noop_nexts, drop_next,
+					      current_sa_index);
+		  goto trace;
+		}
+
 	      /* Save the frame to the list we'll submit at the end */
 	      vec_add1 (ptd->async_frames, async_frames[async_op]);
 	    }
@@ -1088,7 +1098,7 @@ esp_encrypt_inline (vlib_main_t *vm, vlib_node_runtime_t *node,
 	      n_noop += esp_async_recycle_failed_submit (
 		vm, *async_frame, node, ESP_ENCRYPT_ERROR_CRYPTO_ENGINE_ERROR,
 		IPSEC_SA_ERROR_CRYPTO_ENGINE_ERROR, n_noop, noop_bi,
-		noop_nexts, drop_next);
+		noop_nexts, drop_next, true);
 	      vnet_crypto_async_reset_frame (*async_frame);
 	      vnet_crypto_async_free_frame (vm, *async_frame);
 	    }

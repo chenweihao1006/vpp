@@ -67,7 +67,7 @@ class VCLTestCase(VppTestCase):
     def setUpClass(cls):
         if cls.session_startup:
             conf = "session {" + " ".join(cls.session_startup) + "}"
-            cls.extra_vpp_punt_config = [conf]
+            cls.extra_vpp_config = [conf]
         super(VCLTestCase, cls).setUpClass()
 
     @classmethod
@@ -162,10 +162,10 @@ class VCLTestCase(VppTestCase):
             table_id += 1
 
         # Configure namespaces
-        self.vapi.app_namespace_add_del(
+        self.vapi.app_namespace_add_del_v4(
             namespace_id="1", secret=1234, sw_if_index=self.loop0.sw_if_index
         )
-        self.vapi.app_namespace_add_del(
+        self.vapi.app_namespace_add_del_v4(
             namespace_id="2", secret=5678, sw_if_index=self.loop1.sw_if_index
         )
 
@@ -212,10 +212,10 @@ class VCLTestCase(VppTestCase):
             table_id += 1
 
         # Configure namespaces
-        self.vapi.app_namespace_add_del(
+        self.vapi.app_namespace_add_del_v4(
             namespace_id="1", secret=1234, sw_if_index=self.loop0.sw_if_index
         )
-        self.vapi.app_namespace_add_del(
+        self.vapi.app_namespace_add_del_v4(
             namespace_id="2", secret=5678, sw_if_index=self.loop1.sw_if_index
         )
 
@@ -996,6 +996,7 @@ class LDPThruHostStackIperfUdp(VCLTestCase):
             "-t 2",
             "-u",
             "-l 1400",
+            "-P 2",
             "-c",
             self.loop0.local_ip4,
         ]

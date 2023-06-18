@@ -361,6 +361,8 @@ vcl_session_accepted_handler (vcl_worker_t * wrk, session_accepted_msg_t * mp,
   session->transport.lcl_ip = mp->lcl.ip;
   session->session_type = listen_session->session_type;
   session->is_dgram = vcl_proto_is_dgram (session->session_type);
+  if (session->is_dgram)
+    session->flags |= (listen_session->flags & VCL_SESSION_F_CONNECTED);
   session->listener_index = listen_session->session_index;
   listen_session->n_accepted_sessions++;
 
@@ -967,7 +969,7 @@ vcl_session_app_del_segment_handler (vcl_worker_t * wrk, void *data)
 {
   session_app_del_segment_msg_t *msg = (session_app_del_segment_msg_t *) data;
   vcl_segment_detach (msg->segment_handle);
-  VDBG (1, "Unmapped segment: %d", msg->segment_handle);
+  VDBG (1, "Unmapped segment: %lx", msg->segment_handle);
 }
 
 static void
@@ -2419,12 +2421,8 @@ vcl_select_handle_mq_event (vcl_worker_t * wrk, session_event_t * e,
       clib_bitmap_set_no_check ((uword *) write_map, sid, 1);
       *bits_set += 1;
       s = vcl_session_get (wrk, sid);
-      if (!s->tx_fifo)
-	break;
       /* We didn't have a fifo when the event was added */
-      svm_fifo_add_want_deq_ntf (
-	(vcl_session_is_ct (s) ? s->ct_tx_fifo : s->tx_fifo),
-	SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
+      vcl_session_add_want_deq_ntf (s, SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
       break;
     case SESSION_CTRL_EVT_DISCONNECTED:
       disconnected_msg = (session_disconnected_msg_t *) e->data;
@@ -2634,10 +2632,9 @@ vppcom_select (int n_bits, vcl_si_set * read_map, vcl_si_set * write_map,
 	  clib_bitmap_set_no_check ((uword *) write_map, sid, 1);
 	  bits_set++;
 	}
-      else if (s->tx_fifo)
+      else
 	{
-	  svm_fifo_t *txf = vcl_session_is_ct (s) ? s->ct_tx_fifo : s->tx_fifo;
-	  svm_fifo_add_want_deq_ntf (txf, SVM_FIFO_WANT_DEQ_NOTIF);
+	  vcl_session_add_want_deq_ntf (s, SVM_FIFO_WANT_DEQ_NOTIF);
 	}
     }
 
@@ -2799,7 +2796,6 @@ vppcom_epoll_ctl (uint32_t vep_handle, int op, uint32_t session_handle,
   int rv = VPPCOM_OK, add_evt = 0;
   vcl_session_t *vep_session;
   vcl_session_t *s;
-  svm_fifo_t *txf;
 
   if (vep_handle == session_handle)
     {
@@ -2872,16 +2868,22 @@ vppcom_epoll_ctl (uint32_t vep_handle, int op, uint32_t session_handle,
       s->flags |= VCL_SESSION_F_IS_VEP_SESSION;
       vep_session->vep.next_sh = session_handle;
 
-      txf = vcl_session_is_ct (s) ? s->ct_tx_fifo : s->tx_fifo;
-      if (txf && (event->events & EPOLLOUT))
-	svm_fifo_add_want_deq_ntf (txf, SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
-
-      /* Generate EPOLLOUT if tx fifo not full */
-      if ((event->events & EPOLLOUT) && (vcl_session_write_ready (s) > 0))
+      if ((event->events & EPOLLOUT))
 	{
-	  vcl_epoll_ctl_add_unhandled_event (wrk, s, event->events & EPOLLET,
-					     SESSION_IO_EVT_TX);
-	  add_evt = 1;
+	  int write_ready = vcl_session_write_ready (s);
+
+	  vcl_session_add_want_deq_ntf (s, SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
+	  if (write_ready > 0)
+	    {
+	      /* Generate EPOLLOUT if tx fifo not full */
+	      vcl_epoll_ctl_add_unhandled_event (
+		wrk, s, event->events & EPOLLET, SESSION_IO_EVT_TX);
+	      add_evt = 1;
+	    }
+	  else
+	    {
+	      vcl_session_add_want_deq_ntf (s, SVM_FIFO_WANT_DEQ_NOTIF);
+	    }
 	}
       /* Generate EPOLLIN if rx fifo has data */
       if ((event->events & EPOLLIN) && (vcl_session_read_ready (s) > 0))
@@ -2927,13 +2929,23 @@ vppcom_epoll_ctl (uint32_t vep_handle, int op, uint32_t session_handle,
 	  goto done;
 	}
 
-      /* Generate EPOLLOUT if session write ready nd event was not on */
-      if ((event->events & EPOLLOUT) && !(s->vep.ev.events & EPOLLOUT) &&
-	  (vcl_session_write_ready (s) > 0))
+      /* Generate EPOLLOUT if session write ready and event was not on */
+      if ((event->events & EPOLLOUT) && !(s->vep.ev.events & EPOLLOUT))
 	{
-	  vcl_epoll_ctl_add_unhandled_event (wrk, s, event->events & EPOLLET,
-					     SESSION_IO_EVT_TX);
+	  /* Fifo size load acq synchronized with update store rel */
+	  int write_ready = vcl_session_write_ready (s);
+
+	  vcl_session_add_want_deq_ntf (s, SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
+	  if (write_ready > 0)
+	    vcl_epoll_ctl_add_unhandled_event (wrk, s, event->events & EPOLLET,
+					       SESSION_IO_EVT_TX);
+	  else
+	    /* Request deq ntf in case dequeue happened while updating flag */
+	    vcl_session_add_want_deq_ntf (s, SVM_FIFO_WANT_DEQ_NOTIF);
 	}
+      else if (!(event->events & EPOLLOUT))
+	vcl_session_del_want_deq_ntf (s, SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
+
       /* Generate EPOLLIN if session read ready and event was not on */
       if ((event->events & EPOLLIN) && !(s->vep.ev.events & EPOLLIN) &&
 	  (vcl_session_read_ready (s) > 0))
@@ -2943,14 +2955,7 @@ vppcom_epoll_ctl (uint32_t vep_handle, int op, uint32_t session_handle,
 	}
       s->vep.et_mask = VEP_DEFAULT_ET_MASK;
       s->vep.ev = *event;
-      txf = vcl_session_is_ct (s) ? s->ct_tx_fifo : s->tx_fifo;
-      if (txf)
-	{
-	  if (event->events & EPOLLOUT)
-	    svm_fifo_add_want_deq_ntf (txf, SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
-	  else
-	    svm_fifo_del_want_deq_ntf (txf, SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
-	}
+
       VDBG (1, "EPOLL_CTL_MOD: vep_sh %u, sh %u, events 0x%x, data 0x%llx!",
 	    vep_handle, session_handle, event->events, event->data.u64);
       break;
@@ -3010,11 +3015,7 @@ vppcom_epoll_ctl (uint32_t vep_handle, int op, uint32_t session_handle,
       s->flags &= ~VCL_SESSION_F_IS_VEP_SESSION;
 
       if (vcl_session_is_open (s))
-	{
-	  txf = vcl_session_is_ct (s) ? s->ct_tx_fifo : s->tx_fifo;
-	  if (txf)
-	    svm_fifo_del_want_deq_ntf (txf, SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
-	}
+	vcl_session_del_want_deq_ntf (s, SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
 
       VDBG (1, "EPOLL_CTL_DEL: vep_idx %u, sh %u!", vep_handle,
 	    session_handle);
@@ -3066,14 +3067,15 @@ vcl_epoll_wait_handle_mq_event (vcl_worker_t * wrk, session_event_t * e,
       s = vcl_session_get (wrk, sid);
       if (!s || !vcl_session_is_open (s))
 	break;
+      svm_fifo_reset_has_deq_ntf (vcl_session_is_ct (s) ? s->ct_tx_fifo :
+								s->tx_fifo);
       session_events = s->vep.ev.events;
-      if (!(EPOLLOUT & session_events))
+      if (!(EPOLLOUT & session_events) ||
+	  (s->vep.lt_next != VCL_INVALID_SESSION_INDEX))
 	break;
       add_event = 1;
       events[*num_ev].events = EPOLLOUT;
       session_evt_data = s->vep.ev.data.u64;
-      svm_fifo_reset_has_deq_ntf (vcl_session_is_ct (s) ?
-				  s->ct_tx_fifo : s->tx_fifo);
       break;
     case SESSION_CTRL_EVT_ACCEPTED:
       if (!e->postponed)
@@ -3104,12 +3106,10 @@ vcl_epoll_wait_handle_mq_event (vcl_worker_t * wrk, session_event_t * e,
 	break;
       session_events = s->vep.ev.events;
       /* Generate EPOLLOUT because there's no connected event */
-      if (!(EPOLLOUT & session_events) || !s->tx_fifo)
+      if (!(EPOLLOUT & session_events))
 	break;
       /* We didn't have a fifo when the event was added */
-      svm_fifo_add_want_deq_ntf (
-	(vcl_session_is_ct (s) ? s->ct_tx_fifo : s->tx_fifo),
-	SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
+      vcl_session_add_want_deq_ntf (s, SVM_FIFO_WANT_DEQ_NOTIF_IF_FULL);
       add_event = 1;
       events[*num_ev].events = EPOLLOUT;
       session_evt_data = s->vep.ev.data.u64;
@@ -3365,7 +3365,7 @@ static void
 vcl_epoll_wait_handle_lt (vcl_worker_t *wrk, struct epoll_event *events,
 			  int maxevents, u32 *n_evts)
 {
-  u32 add_event = 0, next;
+  u32 add_event = 0, evt_flags = 0, next, *to_remove = 0, *si;
   vcl_session_t *s;
   u64 evt_data;
   int rv;
@@ -3383,26 +3383,28 @@ vcl_epoll_wait_handle_lt (vcl_worker_t *wrk, struct epoll_event *events,
       if ((s->vep.ev.events & EPOLLIN) && (rv = vcl_session_read_ready (s)))
 	{
 	  add_event = 1;
-	  events[*n_evts].events |= rv > 0 ? EPOLLIN : EPOLLHUP | EPOLLRDHUP;
+	  evt_flags |= rv > 0 ? EPOLLIN : EPOLLHUP | EPOLLRDHUP;
 	  evt_data = s->vep.ev.data.u64;
 	}
       if ((s->vep.ev.events & EPOLLOUT) && (rv = vcl_session_write_ready (s)))
 	{
 	  add_event = 1;
-	  events[*n_evts].events |= rv > 0 ? EPOLLOUT : EPOLLHUP | EPOLLRDHUP;
+	  evt_flags |= rv > 0 ? EPOLLOUT : EPOLLHUP | EPOLLRDHUP;
 	  evt_data = s->vep.ev.data.u64;
 	}
       if (!add_event && s->session_state > VCL_STATE_READY)
 	{
 	  add_event = 1;
-	  events[*n_evts].events |= EPOLLHUP | EPOLLRDHUP;
+	  evt_flags |= EPOLLHUP | EPOLLRDHUP;
 	  evt_data = s->vep.ev.data.u64;
 	}
       if (add_event)
 	{
+	  events[*n_evts].events = evt_flags;
 	  events[*n_evts].data.u64 = evt_data;
 	  *n_evts += 1;
 	  add_event = 0;
+	  evt_flags = 0;
 	  if (EPOLLONESHOT & s->vep.ev.events)
 	    s->vep.ev.events = 0;
 	  if (*n_evts == maxevents)
@@ -3413,12 +3415,17 @@ vcl_epoll_wait_handle_lt (vcl_worker_t *wrk, struct epoll_event *events,
 	}
       else
 	{
-	  vcl_epoll_lt_del (wrk, s);
-	  if (wrk->ep_lt_current == VCL_INVALID_SESSION_INDEX)
-	    break;
+	  vec_add1 (to_remove, s->session_index);
 	}
     }
   while (next != wrk->ep_lt_current);
+
+  vec_foreach (si, to_remove)
+    {
+      s = vcl_session_get (wrk, *si);
+      vcl_epoll_lt_del (wrk, s);
+    }
+  vec_free (to_remove);
 }
 
 int
