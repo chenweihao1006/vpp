@@ -102,6 +102,7 @@ bms
 Bn
 boolean
 bootup
+bpf
 Brockners
 bsid
 bss
@@ -397,7 +398,6 @@ Gerrit
 gethostbyname
 gettingsources
 gettingstarted
-ggcov
 gid
 Gigabit
 GigE
